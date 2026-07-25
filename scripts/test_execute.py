@@ -437,8 +437,46 @@ class TestInvokeClaude:
         assert "-p" in cmd
         assert "--dangerously-skip-permissions" in cmd
         assert "--output-format" in cmd
-        assert "PREAMBLE" in cmd[-1]
-        assert "UI를 구현하세요" in cmd[-1]
+
+    def test_prompt_passed_via_stdin(self, executor):
+        """프롬프트는 argv가 아닌 stdin으로 전달한다 (ARG_MAX 초과 방지)."""
+        mock_result = MagicMock(returncode=0, stdout="{}", stderr="")
+        step = {"step": 2, "name": "ui"}
+
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            executor._invoke_claude(step, "PREAMBLE\n")
+
+        cmd = mock_run.call_args[0][0]
+        stdin_input = mock_run.call_args[1]["input"]
+        assert "PREAMBLE" in stdin_input
+        assert "UI를 구현하세요" in stdin_input
+        # argv에는 프롬프트가 포함되지 않아야 한다
+        assert all("PREAMBLE" not in arg for arg in cmd)
+
+    def test_timeout_returns_failed_output(self, executor):
+        """타임아웃 시 traceback 없이 실패 output을 기록하고 반환한다."""
+        step = {"step": 2, "name": "ui"}
+        exc = subprocess.TimeoutExpired(cmd="claude", timeout=1800)
+
+        with patch("subprocess.run", side_effect=exc):
+            output = executor._invoke_claude(step, "preamble")
+
+        assert output["exitCode"] != 0
+        assert "1800" in output["stderr"]
+
+        output_file = executor._phase_dir / "step2-output.json"
+        assert output_file.exists()
+        data = json.loads(output_file.read_text())
+        assert data["exitCode"] != 0
+
+    def test_claude_cli_missing_exits(self, executor):
+        """claude CLI가 없으면 깔끔한 에러 메시지와 함께 종료한다."""
+        step = {"step": 2, "name": "ui"}
+
+        with patch("subprocess.run", side_effect=FileNotFoundError("claude")):
+            with pytest.raises(SystemExit) as exc_info:
+                executor._invoke_claude(step, "preamble")
+        assert exc_info.value.code == 1
 
     def test_saves_output_json(self, executor):
         mock_result = MagicMock(returncode=0, stdout='{"ok": true}', stderr="")
@@ -468,6 +506,34 @@ class TestInvokeClaude:
             executor._invoke_claude(step, "preamble")
 
         assert mock_run.call_args[1]["timeout"] == 1800
+
+
+# ---------------------------------------------------------------------------
+# _fallback_error
+# ---------------------------------------------------------------------------
+
+class TestFallbackError:
+    """status 미갱신 시 재시도 프롬프트에 넣을 fallback 에러 메시지 생성."""
+
+    def test_clean_exit_generic_message(self, executor):
+        output = {"exitCode": 0, "stdout": "", "stderr": ""}
+        assert executor._fallback_error(output) == "Step did not update status"
+
+    def test_abnormal_exit_includes_code_and_stderr(self, executor):
+        output = {"exitCode": 137, "stdout": "", "stderr": "out of memory"}
+        msg = executor._fallback_error(output)
+        assert "137" in msg
+        assert "out of memory" in msg
+
+    def test_abnormal_exit_without_stderr(self, executor):
+        output = {"exitCode": -1, "stdout": "", "stderr": ""}
+        msg = executor._fallback_error(output)
+        assert "-1" in msg
+
+    def test_stderr_truncated(self, executor):
+        output = {"exitCode": 1, "stdout": "", "stderr": "x" * 5000}
+        msg = executor._fallback_error(output)
+        assert len(msg) < 1000
 
 
 # ---------------------------------------------------------------------------

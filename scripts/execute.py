@@ -54,6 +54,7 @@ class StepExecutor:
     """Phase 디렉토리 안의 step들을 순차 실행하는 하네스."""
 
     MAX_RETRIES = 3
+    CLAUDE_TIMEOUT = 1800  # Claude 호출 제한 시간 (초)
     FEAT_MSG = "feat({phase}): step {num} — {name}"
     CHORE_MSG = "chore({phase}): step {num} output"
     TZ = timezone(timedelta(hours=9))
@@ -234,27 +235,57 @@ class StepExecutor:
             print(f"  ERROR: {step_file} not found")
             sys.exit(1)
 
+        # 프롬프트는 stdin으로 전달한다. argv로 넘기면 guardrails(문서 전체)가
+        # 커질 경우 ARG_MAX를 초과할 수 있다.
         prompt = preamble + step_file.read_text()
-        result = subprocess.run(
-            ["claude", "-p", "--dangerously-skip-permissions", "--output-format", "json", prompt],
-            cwd=self._root, capture_output=True, text=True, timeout=1800,
-        )
+        cmd = ["claude", "-p", "--dangerously-skip-permissions", "--output-format", "json"]
+        try:
+            result = subprocess.run(
+                cmd, cwd=self._root, capture_output=True, text=True,
+                input=prompt, timeout=self.CLAUDE_TIMEOUT,
+            )
+            exit_code, stdout, stderr = result.returncode, result.stdout, result.stderr
+        except subprocess.TimeoutExpired as e:
+            exit_code = -1
+            stdout = self._decode(e.stdout)
+            stderr = f"Claude 호출이 {self.CLAUDE_TIMEOUT}초 안에 완료되지 않아 중단됨"
+        except FileNotFoundError:
+            print(f"\n  ERROR: 'claude' CLI를 찾을 수 없습니다. PATH를 확인하세요.")
+            sys.exit(1)
 
-        if result.returncode != 0:
-            print(f"\n  WARN: Claude가 비정상 종료됨 (code {result.returncode})")
-            if result.stderr:
-                print(f"  stderr: {result.stderr[:500]}")
+        if exit_code != 0:
+            print(f"\n  WARN: Claude가 비정상 종료됨 (code {exit_code})")
+            if stderr:
+                print(f"  stderr: {stderr[:500]}")
 
         output = {
             "step": step_num, "name": step_name,
-            "exitCode": result.returncode,
-            "stdout": result.stdout, "stderr": result.stderr,
+            "exitCode": exit_code,
+            "stdout": stdout, "stderr": stderr,
         }
         out_path = self._phase_dir / f"step{step_num}-output.json"
-        with open(out_path, "w") as f:
+        with open(out_path, "w", encoding="utf-8") as f:
             json.dump(output, f, indent=2, ensure_ascii=False)
 
         return output
+
+    @staticmethod
+    def _decode(data) -> str:
+        """TimeoutExpired가 담아주는 부분 출력(bytes 또는 str)을 str로 정규화한다."""
+        if data is None:
+            return ""
+        if isinstance(data, bytes):
+            return data.decode("utf-8", errors="replace")
+        return data
+
+    @staticmethod
+    def _fallback_error(output: dict) -> str:
+        """Claude 세션이 status를 갱신하지 않았을 때 재시도 프롬프트에 넣을 에러 메시지."""
+        if output["exitCode"] == 0:
+            return "Step did not update status"
+        msg = f"Claude 프로세스 비정상 종료 (code {output['exitCode']})"
+        detail = (output.get("stderr") or "").strip()[:500]
+        return f"{msg}: {detail}" if detail else msg
 
     # --- 헤더 & 검증 ---
 
@@ -306,7 +337,7 @@ class StepExecutor:
                 tag += f" [retry {attempt}/{self.MAX_RETRIES}]"
 
             with progress_indicator(tag) as pi:
-                self._invoke_claude(step, preamble)
+                output = self._invoke_claude(step, preamble)
                 elapsed = int(pi.elapsed)
 
             index = self._read_json(self._index_file)
@@ -333,9 +364,10 @@ class StepExecutor:
                 self._update_top_index("blocked")
                 sys.exit(2)
 
+            fallback = self._fallback_error(output)
             err_msg = next(
-                (s.get("error_message", "Step did not update status") for s in index["steps"] if s["step"] == step_num),
-                "Step did not update status",
+                (s.get("error_message", fallback) for s in index["steps"] if s["step"] == step_num),
+                fallback,
             )
 
             if attempt < self.MAX_RETRIES:
