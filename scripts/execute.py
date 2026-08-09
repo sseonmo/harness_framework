@@ -341,7 +341,7 @@ class StepExecutor:
 
             with progress_indicator(tag) as pi:
                 output = self._invoke_claude(step, preamble)
-                elapsed = int(pi.elapsed)
+            elapsed = int(pi.elapsed)  # elapsed는 with 블록을 빠져나온 뒤에 확정된다
 
             index = self._read_json(self._index_file)
             status = next((s.get("status", "pending") for s in index["steps"] if s["step"] == step_num), "pending")
