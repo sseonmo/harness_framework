@@ -103,7 +103,10 @@ class StepExecutor:
 
     @staticmethod
     def _write_json(p: Path, data: dict):
-        p.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        # 쓰는 도중 중단되어도 원본이 잘리지 않도록 임시 파일에 쓴 뒤 교체한다.
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, p)
 
     # --- git ---
 
@@ -179,11 +182,11 @@ class StepExecutor:
         sections = []
         claude_md = ROOT / "CLAUDE.md"
         if claude_md.exists():
-            sections.append(f"## 프로젝트 규칙 (CLAUDE.md)\n\n{claude_md.read_text()}")
+            sections.append(f"## 프로젝트 규칙 (CLAUDE.md)\n\n{claude_md.read_text(encoding='utf-8')}")
         docs_dir = ROOT / "docs"
         if docs_dir.is_dir():
             for doc in sorted(docs_dir.glob("*.md")):
-                sections.append(f"## {doc.stem}\n\n{doc.read_text()}")
+                sections.append(f"## {doc.stem}\n\n{doc.read_text(encoding='utf-8')}")
         return "\n\n---\n\n".join(sections) if sections else ""
 
     @staticmethod
@@ -237,7 +240,7 @@ class StepExecutor:
 
         # 프롬프트는 stdin으로 전달한다. argv로 넘기면 guardrails(문서 전체)가
         # 커질 경우 ARG_MAX를 초과할 수 있다.
-        prompt = preamble + step_file.read_text()
+        prompt = preamble + step_file.read_text(encoding="utf-8")
         cmd = ["claude", "-p", "--dangerously-skip-permissions", "--output-format", "json"]
         try:
             result = subprocess.run(
